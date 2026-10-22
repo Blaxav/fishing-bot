@@ -12,6 +12,7 @@ Levels used below were measured on a real setup (Stereo Mix loopback):
 import builtins
 import os
 import time
+from unittest import mock
 
 # Deterministic tuning, independent of .env / the shell environment
 os.environ["WOWBOT_MIN_AMP"] = "0.0015"
@@ -141,6 +142,67 @@ def test_printing_failure_cannot_break_the_audio_thread() -> None:
     finally:
         builtins.print = original_print
     assert not monitor._messages
+
+
+def _patched_devices():
+    """Patch sounddevice enumeration with a deterministic fake machine."""
+    return mock.patch.multiple(
+        audio.sd,
+        query_devices=mock.Mock(return_value=FAKE_DEVICES),
+        query_hostapis=mock.Mock(return_value=FAKE_HOST_APIS),
+    )
+
+
+FAKE_DEVICES = [
+    # 0: WASAPI microphone (must not be preferred over Stereo Mix)
+    {"name": "Microphone (USB)", "hostapi": 2, "max_input_channels": 2,
+     "max_output_channels": 0, "default_samplerate": 48000.0},
+    # 1: output-only device (cannot be captured from)
+    {"name": "Speakers (Realtek)", "hostapi": 2, "max_input_channels": 0,
+     "max_output_channels": 2, "default_samplerate": 48000.0},
+    # 2: localised Stereo Mix (MME)
+    {"name": "Mixage stéréo (Realtek)", "hostapi": 0, "max_input_channels": 2,
+     "max_output_channels": 0, "default_samplerate": 44100.0},
+    # 3: virtual cable (WASAPI)
+    {"name": "CABLE Output (VB-Audio)", "hostapi": 2, "max_input_channels": 2,
+     "max_output_channels": 0, "default_samplerate": 48000.0},
+]
+
+FAKE_HOST_APIS = [
+    {"name": "MME", "default_input_device": 2, "default_output_device": 1},
+    {"name": "Windows DirectSound", "default_input_device": 0,
+     "default_output_device": 1},
+    {"name": "Windows WASAPI", "default_input_device": 0,
+     "default_output_device": 1},
+]
+
+
+def test_capture_candidates_prefers_stereo_mix() -> None:
+    """A new PC may expose a mic first; Stereo Mix must still win."""
+    with _patched_devices():
+        candidates = audio.AudioMonitor._capture_candidates()
+    assert candidates[0] == 2, f"Stereo Mix should be tried first, got {candidates}"
+    assert candidates[-1] is None, f"default input must be last, got {candidates}"
+    assert 1 not in candidates, "output-only devices cannot be captured from"
+    assert candidates.index(3) < candidates.index(0), (
+        f"a virtual cable should be preferred over a plain microphone, got {candidates}")
+
+
+def test_audio_device_override_by_index() -> None:
+    with mock.patch.dict(os.environ, {"WOWBOT_AUDIO_DEVICE": "1"}), _patched_devices():
+        assert audio.AudioMonitor._capture_candidates() == [1]
+
+
+def test_audio_device_override_by_name() -> None:
+    with mock.patch.dict(os.environ, {"WOWBOT_AUDIO_DEVICE": "cable"}), _patched_devices():
+        assert audio.AudioMonitor._capture_candidates() == [3]
+
+
+def test_unknown_audio_device_falls_back_to_auto() -> None:
+    with mock.patch.dict(os.environ, {"WOWBOT_AUDIO_DEVICE": "no-such-device"}), \
+            _patched_devices():
+        candidates = audio.AudioMonitor._capture_candidates()
+    assert candidates[0] == 2, f"auto-detection should still run, got {candidates}"
 
 
 def main() -> int:

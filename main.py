@@ -15,6 +15,7 @@ Usage:
 Environment variables:
     WOWBOT_HOTKEY   — Key combo to start/stop (default: "ctrl+shift+f")
     WOWBOT_FISH_KEY — Key to cast fishing (default: "1")
+    WOWBOT_AUDIO_DEVICE — Capture device index or name substring (see --list-audio)
     SCAN_LEFT, SCAN_TOP, SCAN_WIDTH, SCAN_HEIGHT — Limit screen scan region
 """
 
@@ -102,9 +103,20 @@ def _audio_debug_mode() -> None:
     monitor = AudioMonitor(debug=True)
     monitor.start()
 
+    if not monitor.healthy():
+        print("[Level] No capture stream - the numbers below would never move.")
+        print("[Level] Run `uv run python main.py --list-audio`, enable Stereo Mix")
+        print("[Level] (or set WOWBOT_AUDIO_DEVICE to another device index).")
+        monitor.stop()
+        return
+
     try:
         while True:
             time.sleep(0.25)
+            if not monitor.healthy():
+                print("[Level] Audio stream stopped - ending calibration.",
+                      flush=True)
+                break
             snap = monitor.snapshot()
             floor = snap["floor"]
             ratio = (snap["rms"] / floor) if floor > 0 else 0.0
@@ -114,10 +126,9 @@ def _audio_debug_mode() -> None:
                 f"max={snap['max_rms']:.5f} triggers={snap['triggers']}",
                 flush=True,
             )
-            if not monitor.healthy():
-                print("[Level] WARNING: audio stream is not running!", flush=True)
     except KeyboardInterrupt:
         print("\nStopping...")
+    finally:
         monitor.stop()
 
     snap = monitor.snapshot()

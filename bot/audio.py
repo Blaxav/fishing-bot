@@ -1,7 +1,8 @@
-"""Audio-based fish bite detection using WASAPI loopback.
+"""Audio-based fish bite detection using a loopback recording device.
 
-Captures system audio output and detects amplitude spikes
-corresponding to the fishing splash sound in WoW Classic.
+Captures whatever the speakers play (Stereo Mix, "Mixage stéréo", What U Hear
+or a virtual cable) and detects amplitude spikes corresponding to the fishing
+splash sound in WoW Classic.
 """
 
 import threading
@@ -38,6 +39,41 @@ def _env_bool(name: str, default: bool) -> bool:
     if val is not None:
         return val.lower() in ("1", "true", "yes")
     return default
+
+
+# Recording devices that natively capture speaker output. Names are localised
+# ("Mixage stéréo" is the French "Stereo Mix", "What U Hear" the SoundBlaster
+# one). Virtual cables such as VB-Audio show up as "CABLE Output" and are
+# equally valid: WoW is routed to "CABLE Input", we listen to "CABLE Output".
+STEREO_MIX_NAMES = (
+    "stereo mix",
+    "mixage st",
+    "wave out mix",
+    "what u hear",
+    "loopback",
+    "cable output",
+    "vb-audio",
+    "voicemeeter out",
+)
+
+
+def _resolve_device(value: str, devices) -> Optional[int]:
+    """Resolve a WOWBOT_AUDIO_DEVICE value (index or name substring) to an index."""
+    value = value.strip()
+    if not value:
+        return None
+    if value.isdigit():
+        index = int(value)
+        if index < len(devices):
+            return index
+        print(f"[Audio] WOWBOT_AUDIO_DEVICE={value}: only {len(devices)} device(s) available.")
+        return None
+    needle = value.lower()
+    for index, device in enumerate(devices):
+        if needle in device["name"].lower():
+            return index
+    print(f"[Audio] WOWBOT_AUDIO_DEVICE={value!r}: no device name contains that text.")
+    return None
 
 
 # ── Tuning constants (overridable via env vars) ───────────────────────
@@ -142,26 +178,39 @@ class AudioMonitor:
         self._messages.append(message)
 
     def start(self) -> None:
-        """Start capturing system audio via WASAPI loopback."""
+        """Start capturing system audio."""
         if self._running:
             return
 
         self._running = True
         self._bite_flag.clear()
+        self._callback_error = None
+        # Drop the previous (closed) stream so the wait loop below cannot mistake
+        # it for the new one when start() is called again after stop().
+        self._stream = None
 
-        # Try to find the WASAPI loopback device
-        device = self._find_loopback_device()
+        # Ordered list of devices to try (best first, None = default input).
+        devices = self._capture_candidates()
 
         self._thread = threading.Thread(
             target=self._audio_thread,
-            args=(device,),
+            args=(devices,),
             daemon=True,
         )
         self._thread.start()
 
-        # Wait for audio stream to initialize
-        time.sleep(0.3)
-        print(f"[Audio] Monitoring system audio for splash sounds...")
+        # Wait for the stream to open (sample-rate fallbacks can take a moment).
+        for _ in range(40):
+            if self._stream is not None or not self._thread.is_alive():
+                break
+            time.sleep(0.05)
+        self._drain_messages()
+
+        if self.healthy():
+            print("[Audio] Monitoring system audio for splash sounds...")
+        else:
+            print("[Audio] WARNING: no audio capture stream - "
+                  "splash detection is disabled.")
 
     def stop(self) -> None:
         """Stop audio capture."""
@@ -202,67 +251,95 @@ class AudioMonitor:
         self._bite_flag.clear()
 
     @staticmethod
-    def _find_loopback_device():
-        """Find a device that can capture system audio output.
+    def _capture_candidates() -> list:
+        """Ordered list of devices to try for system-audio capture.
+
+        ``None`` means "whatever Windows considers the default input". The
+        PortAudio build bundled with sounddevice has no WASAPI loopback, so an
+        output device cannot be opened for capture: only *recording* devices
+        (Stereo Mix, "What U Hear", a virtual cable, ...) can hear the game.
 
         Priority:
-        1. "Stereo Mix" / "Mixage stéréo" — records speaker output natively
-        2. WASAPI loopback on the default output device
-        3. Any input device on the WASAPI host API
+        1. WOWBOT_AUDIO_DEVICE (index or name substring), when set
+        2. Stereo Mix / Mixage stéréo / What U Hear / virtual cable inputs
+        3. Any other WASAPI input
+        4. System default input (usually a microphone - last resort)
         """
         devices = sd.query_devices()
         host_apis = sd.query_hostapis()
 
-        # 1. Search for Stereo Mix / Mixage stéréo by name
-        stereo_mix_names = ("stereo mix", "mixage st", "wave out mix", "what u hear", "loopback")
-        for idx, dev in enumerate(devices):
-            if dev["max_input_channels"] > 0:
-                name_lower = dev["name"].lower()
-                if any(kw in name_lower for kw in stereo_mix_names):
-                    print(f"[Audio] Using Stereo Mix device [{idx}]: {dev['name']}")
-                    return idx
+        override = os.environ.get("WOWBOT_AUDIO_DEVICE", "").strip()
+        if override:
+            index = _resolve_device(override, devices)
+            if index is not None:
+                return [index]
+            print("[Audio] Ignoring WOWBOT_AUDIO_DEVICE and auto-detecting.")
 
-        # Find WASAPI host API index
-        wasapi_api_idx = None
+        candidates: list = []
+
+        # 1. Devices that natively record the speaker output.
+        for idx, dev in enumerate(devices):
+            if dev["max_input_channels"] < 1:
+                continue
+            name = dev["name"].lower()
+            if any(keyword in name for keyword in STEREO_MIX_NAMES):
+                candidates.append(idx)
+
+        # 2. Other WASAPI inputs (e.g. a virtual cable selected by the user).
+        wasapi_idx = None
         for i, api in enumerate(host_apis):
             if "WASAPI" in api["name"]:
-                wasapi_api_idx = i
+                wasapi_idx = i
                 break
-
-        if wasapi_api_idx is not None:
-            # 2. Try WASAPI default output device for loopback
-            wasapi_default_out = host_apis[wasapi_api_idx].get("default_output_device")
-            if wasapi_default_out is not None and 0 <= wasapi_default_out < len(devices):
-                dev = devices[wasapi_default_out]
-                print(f"[Audio] Using WASAPI output device [{wasapi_default_out}]: {dev['name']}")
-                return wasapi_default_out
-
-            # 3. Fallback: any WASAPI input device
+        if wasapi_idx is not None:
             for idx, dev in enumerate(devices):
-                if dev["hostapi"] == wasapi_api_idx and dev["max_input_channels"] > 0:
-                    print(f"[Audio] Using WASAPI input device [{idx}]: {dev['name']}")
-                    return idx
+                if (dev["hostapi"] == wasapi_idx
+                        and dev["max_input_channels"] > 0
+                        and idx not in candidates):
+                    candidates.append(idx)
 
-        print("[Audio] No system-audio capture device found.")
-        print("[Audio] Enable 'Stereo Mix' in Windows Sound settings -> Recording tab.")
-        print("[Audio] Run --list-audio to see available devices.")
-        return None
+        # 3. Default input, last.
+        candidates.append(None)
+        return candidates
 
     @staticmethod
-    def _get_wasapi_extra():
-        """Return WASAPI loopback extra settings for sounddevice."""
-        try:
-            return sd.WasapiSettings()
-        except AttributeError:
-            pass
+    def _find_loopback_device():
+        """Best capture device index (kept for diagnostics/backwards compat)."""
+        candidates = AudioMonitor._capture_candidates()
+        return candidates[0] if candidates else None
 
-        try:
-            from _sounddevice_data.wasapi import WasapiSettings as _WasapiSettings
-            return _WasapiSettings()
-        except ImportError:
-            pass
+    def _open_stream(self, device, samplerate: int):
+        """Open and start an input stream, raising on failure."""
+        dev_info = (sd.query_devices(device) if device is not None
+                    else sd.query_devices(kind="input"))
+        channels = int(dev_info["max_input_channels"])
+        if channels < 1:
+            raise RuntimeError("device has no input channels")
 
-        return None
+        host_apis = sd.query_hostapis()
+        hostapi = dev_info["hostapi"]
+        is_wasapi = (
+            hostapi is not None
+            and 0 <= hostapi < len(host_apis)
+            and "WASAPI" in host_apis[hostapi]["name"]
+        )
+
+        stream_kwargs = dict(
+            device=device,
+            channels=channels,
+            samplerate=samplerate,
+            blocksize=max(int(samplerate * BLOCK_DURATION), 1),
+            callback=self._callback,
+            dtype="float32",
+        )
+        # WASAPI shared mode rejects rates the device does not support unless
+        # auto_convert is enabled (e.g. 22050 Hz on a 48000 Hz Stereo Mix).
+        if is_wasapi:
+            stream_kwargs["extra_settings"] = sd.WasapiSettings(auto_convert=True)
+
+        stream = sd.InputStream(**stream_kwargs)
+        stream.start()
+        return stream
 
     def _drain_messages(self) -> None:
         """Print messages queued by the realtime callback."""
@@ -333,75 +410,105 @@ class AudioMonitor:
                     f"min_amp={MIN_AMPLITUDE} spike_mult={SPIKE_THRESHOLD_MULTIPLIER} "
                     f"-> {reason}")
 
-    def _audio_thread(self, device) -> None:
-        """Background thread: captures audio and detects spikes."""
-        blocksize = int(SAMPLE_RATE * BLOCK_DURATION)
+    def _callback(self, indata, frames, time_info, status) -> None:
+        # Runs on the PortAudio realtime thread: never print or touch the
+        # filesystem here. Any exception escaping this function aborts the
+        # stream for the rest of the session, so everything is caught and
+        # reported through the message queue instead.
+        if not self._running:
+            return
+        try:
+            self._process_block(indata)
+        except Exception as exc:  # noqa: BLE001 - never kill the stream
+            self._callback_error = exc
+            self._emit(f"[Audio] Detection error: {exc!r}")
 
-        def audio_callback(indata, frames, time_info, status):
-            # Runs on the PortAudio realtime thread: never print or touch the
-            # filesystem here. Any exception escaping this function aborts the
-            # stream for the rest of the session, so everything is caught and
-            # reported through the message queue instead.
-            if not self._running:
-                return
+    def _audio_thread(self, devices) -> None:
+        """Initialise COM on this thread, then run the capture loop."""
+        # PortAudio's WASAPI backend needs COM initialised on the thread that
+        # opens the stream. sounddevice only initialises COM for the thread
+        # that first touched PortAudio (usually the main thread), so opening a
+        # WASAPI device from here fails with "Unanticipated host error"
+        # otherwise. MME/DirectSound do not care, which is why the bug only
+        # shows up on machines whose only capture device is WASAPI.
+        com_initialised = False
+        if os.name == "nt":
             try:
-                self._process_block(indata)
-            except Exception as exc:  # noqa: BLE001 - never kill the stream
-                self._callback_error = exc
-                self._emit(f"[Audio] Detection error: {exc!r}")
+                import ctypes
+                ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # STA
+                com_initialised = True
+            except Exception:  # noqa: BLE001 - best effort
+                pass
 
-        # Try a sequence of devices — first the "best" (Stereo Mix/loopback),
-        # then fall back to default input if that fails.
-        devices_to_try = [device]
-        if device is not None:
-            devices_to_try.append(None)  # system default input as fallback
+        try:
+            self._run_capture(devices)
+        finally:
+            if com_initialised:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
 
+    def _run_capture(self, devices) -> None:
+        """Open the best capture device and detect spikes."""
         last_error = None
+        failures = []
         stream_started = False
-        for try_device in devices_to_try:
+
+        for device in devices:
             try:
-                if try_device is not None:
-                    dev_info = sd.query_devices(try_device)
-                    channels = dev_info["max_input_channels"]
-                    if channels < 1:
-                        channels = 2
-
-                    host_apis = sd.query_hostapis()
-                    is_wasapi = (
-                        dev_info["hostapi"] is not None
-                        and dev_info["hostapi"] < len(host_apis)
-                        and "WASAPI" in host_apis[dev_info["hostapi"]]["name"]
-                    )
-                else:
-                    channels = 2
-                    is_wasapi = False
-
-                extra = self._get_wasapi_extra() if is_wasapi else None
-                stream_kwargs = dict(
-                    device=try_device,
-                    channels=channels,
-                    samplerate=SAMPLE_RATE,
-                    blocksize=blocksize,
-                    callback=audio_callback,
-                    dtype="float32",
-                )
-                if extra is not None:
-                    stream_kwargs["extra_settings"] = extra
-                self._stream = sd.InputStream(**stream_kwargs)
-                self._stream.start()
-                stream_started = True
-                if try_device != device:
-                    dev_name = sd.query_devices(try_device)["name"] if try_device is not None else "default input"
-                    print(f"[Audio] Fallback: using device '{dev_name}'")
-                break
-            except Exception as e:
-                last_error = e
+                info = (sd.query_devices(device) if device is not None
+                        else sd.query_devices(kind="input"))
+            except Exception as exc:  # noqa: BLE001 - device vanished
+                last_error = exc
+                failures.append(f"device {device!r}: {exc}")
                 continue
 
+            label = (f"[{device}] {info['name']}" if device is not None
+                     else f"default input '{info['name']}'")
+
+            if info["max_input_channels"] < 1:
+                last_error = RuntimeError("not an input device")
+                failures.append(f"{label}: no input channels")
+                continue
+
+            if device is None:
+                print("[Audio] WARNING: falling back to the system default input.")
+                print("[Audio] WARNING: that is usually a microphone and will NOT "
+                      "hear the game - enable 'Stereo Mix' in Windows sound settings.")
+
+            rates = [SAMPLE_RATE]
+            default_rate = int(info.get("default_samplerate") or SAMPLE_RATE)
+            if default_rate != SAMPLE_RATE:
+                rates.append(default_rate)
+
+            for rate in rates:
+                try:
+                    stream = self._open_stream(device, rate)
+                except Exception as exc:  # noqa: BLE001 - try next rate/device
+                    last_error = exc
+                    continue
+                # Publish the stream only after reporting it, so start()'s
+                # "Monitoring..." line always comes after this one.
+                print(f"[Audio] Capturing from {label} "
+                      f"({info['max_input_channels']} ch @ {rate} Hz).")
+                self._stream = stream
+                stream_started = True
+                break
+
+            if stream_started:
+                break
+            failures.append(f"{label}: {last_error}")
+
         if not stream_started:
-            print(f"[Audio] Error: {last_error}")
-            print("[Audio] Try: Settings -> Sound -> Recording -> enable 'Stereo Mix'")
-            print("[Audio] Or install VB-Audio Virtual Cable (free)")
+            print(f"[Audio] Could not start audio capture ({last_error!r}).")
+            for failure in failures:
+                print(f"[Audio]   {failure}")
+            print("[Audio] Enable a recording device that hears the game:")
+            print("[Audio]   Windows Settings -> System -> Sound -> More sound settings")
+            print("[Audio]   -> Recording -> right-click -> Show Disabled Devices")
+            print("[Audio]   -> enable 'Stereo Mix' (or install VB-Audio Virtual Cable)")
+            print("[Audio] Then check: uv run python main.py --list-audio")
             return
 
         # Main loop — keep thread alive while streaming
@@ -433,27 +540,43 @@ def list_audio_devices() -> None:
         print("sounddevice not installed.")
         return
 
-    print("=" * 60)
-    print("  Available Audio Devices")
-    print("=" * 60)
     devices = sd.query_devices()
+    host_apis = sd.query_hostapis()
+
+    print("=" * 90)
+    print("  Available Audio Devices")
+    print("=" * 90)
     for idx, dev in enumerate(devices):
         in_ch = dev["max_input_channels"]
         out_ch = dev["max_output_channels"]
-        name = dev["name"]
-        host = dev["hostapi"]
+        host_idx = dev["hostapi"]
+        host = host_apis[host_idx]["name"] if host_idx < len(host_apis) else "?"
+        api = host_apis[host_idx] if host_idx < len(host_apis) else {}
         default = ""
-        # Check if this device matches a relevant default
-        host_apis = sd.query_hostapis()
-        if host < len(host_apis):
-            api = host_apis[host]
-            if idx == api.get("default_input_device"):
-                default = " [DEFAULT INPUT]"
-            elif idx == api.get("default_output_device"):
-                default = " [DEFAULT OUTPUT]"
-        print(f"  [{idx}] {name} (in={in_ch}, out={out_ch}){default}")
-    print("=" * 60)
+        if idx == api.get("default_input_device"):
+            default = " [DEFAULT INPUT]"
+        elif idx == api.get("default_output_device"):
+            default = " [DEFAULT OUTPUT]"
+        print(f"  [{idx:2}] {host:<20} in={in_ch} out={out_ch} "
+              f"{dev['name']}{default}")
+    print("=" * 90)
+    print("The bot can only capture from a device with in>0 that hears the game:")
+    print("  Stereo Mix / Mixage stéréo / What U Hear, or a virtual cable.")
+    print("The PortAudio build used here has NO WASAPI loopback, so output-only")
+    print("devices (in=0) cannot be used for capture.")
     print()
-    print("Look for a device with 'loopback' in the name (WASAPI).")
-    print("If none: right-click speaker -> Sounds -> Recording ->")
-    print("  enable 'Stereo Mix', OR install VB-Audio Virtual Cable.")
+
+    candidates = AudioMonitor._capture_candidates()
+    print("Bot would try, in order:")
+    for position, device in enumerate(candidates, start=1):
+        if device is None:
+            info = sd.query_devices(kind="input")
+            print(f"  {position}. default input [{info['index']}] {info['name']} "
+                  f"(last resort - usually a microphone)")
+        else:
+            info = devices[device]
+            print(f"  {position}. [{device}] {info['name']}")
+    print()
+    print("Force a device with its index or part of its name in .env:")
+    print("  WOWBOT_AUDIO_DEVICE=23")
+    print("Then run: uv run python main.py --audio-debug")
