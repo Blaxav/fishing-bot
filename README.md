@@ -117,7 +117,21 @@ If no Stereo Mix exists (some laptop drivers hide it), install
 uv run python main.py --calibrate
 ```
 
-Click the top-left and bottom-right corners of your game window, then copy-paste the printed environment variables.
+Move the mouse to the top-left corner of the game area and press ENTER, then to
+the bottom-right corner and press ENTER again. The region is written straight to
+`config.json` — no copy-paste, no `.env` edit — and is picked up on the next
+launch:
+
+```json
+{
+  "scan_region": { "left": 1001, "top": 361, "width": 637, "height": 343 }
+}
+```
+
+`config.json` is machine-specific (coordinates depend on your monitor layout) and
+is git-ignored, so every PC needs its own `--calibrate` run after moving the game
+window. Delete the file to go back to scanning the full primary monitor. The old
+`SCAN_*` environment variables are no longer read.
 
 ## Tuning Audio Detection
 

@@ -5,7 +5,7 @@ Press Ctrl+C in the terminal to exit.
 
 Usage:
     python main.py                  # Normal mode
-    python main.py --calibrate      # Calibrate screen region
+    python main.py --calibrate      # Calibrate screen region (saved to config.json)
     python main.py --test-input     # Test if key presses reach the game
     python main.py --test-bobber    # Debug bobber detection (saves image)
     python main.py --list-audio     # List capture devices / verify Stereo Mix
@@ -16,7 +16,8 @@ Environment variables:
     WOWBOT_HOTKEY   — Key combo to start/stop (default: "ctrl+shift+f")
     WOWBOT_FISH_KEY — Key to cast fishing (default: "1")
     WOWBOT_AUDIO_DEVICE — Capture device index or name substring (see --list-audio)
-    SCAN_LEFT, SCAN_TOP, SCAN_WIDTH, SCAN_HEIGHT — Limit screen scan region
+
+The scan region is stored in config.json and written by --calibrate.
 """
 
 import os
@@ -37,6 +38,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 import keyboard
 from bot import FisherBot
+from bot import config
 from bot import screen
 from bot import input as inp
 from bot.audio import AudioMonitor, list_audio_devices
@@ -68,20 +70,28 @@ def calibration_mode():
     width = abs(x2 - x1)
     height = abs(y2 - y1)
 
+    if width < 2 or height < 2:
+        print()
+        print("=" * 50)
+        print("  The two points are too close together - nothing saved.")
+        print("  Run the calibration again and pick opposite corners.")
+        print("=" * 50)
+        return
+
+    region = {"left": left, "top": top, "width": width, "height": height}
+    try:
+        path = config.set_scan_region(region)
+    except OSError as exc:
+        print()
+        print(f"[Calibrate] Could not write {config.CONFIG_PATH}: {exc}")
+        print("[Calibrate] Check that the folder is writable and try again.")
+        return
+
     print()
     print("=" * 50)
-    print("  Set these environment variables before launching:")
-    print()
-    print(f"  set SCAN_LEFT={left}")
-    print(f"  set SCAN_TOP={top}")
-    print(f"  set SCAN_WIDTH={width}")
-    print(f"  set SCAN_HEIGHT={height}")
-    print()
-    print("  Or in PowerShell:")
-    print(f"  $env:SCAN_LEFT={left}")
-    print(f"  $env:SCAN_TOP={top}")
-    print(f"  $env:SCAN_WIDTH={width}")
-    print(f"  $env:SCAN_HEIGHT={height}")
+    print(f"  Scan region saved to {path.name}")
+    print(f"  left={left}  top={top}  width={width}  height={height}")
+    print("  It is used automatically on the next launch - nothing to copy.")
     print("=" * 50)
 
 
@@ -201,22 +211,18 @@ def main():
     toggle_hotkey = os.environ.get("WOWBOT_HOTKEY", "ctrl+shift+f")
     fishing_key = os.environ.get("WOWBOT_FISH_KEY", "1")
 
-    # ── Scan region configuration ─────────────────────────────────────
-    region = None
-    left = os.environ.get("SCAN_LEFT")
-    top = os.environ.get("SCAN_TOP")
-    width = os.environ.get("SCAN_WIDTH")
-    height = os.environ.get("SCAN_HEIGHT")
+    # ── Scan region configuration (config.json, written by --calibrate) ──
+    stale = [name for name in ("SCAN_LEFT", "SCAN_TOP", "SCAN_WIDTH", "SCAN_HEIGHT")
+             if name in os.environ]
+    if stale:
+        print("[Bot] SCAN_* environment variables are ignored - the scan region")
+        print(f"[Bot] now lives in {config.CONFIG_PATH.name}; re-run --calibrate.")
 
-    if all(v is not None for v in (left, top, width, height)):
-        region = {
-            "left": int(left),       # type: ignore[arg-type]
-            "top": int(top),          # type: ignore[arg-type]
-            "width": int(width),      # type: ignore[arg-type]
-            "height": int(height),    # type: ignore[arg-type]
-        }
+    region = config.get_scan_region()
+    if region is not None:
         screen.set_region(region)
-        print(f"[Bot] Scan region: {left}x{top} {width}*{height}")
+        print(f"[Bot] Scan region: {region['left']}x{region['top']} "
+              f"{region['width']}*{region['height']}")
     else:
         print("[Bot] Scanning full primary monitor.")
         print("[Bot] Tip: Run 'python main.py --calibrate' to set a scan region.")

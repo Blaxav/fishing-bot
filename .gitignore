@@ -11,6 +11,10 @@ wheels/
 
 debug_frames/*
 
+# Calibrated scan region (machine-specific, written by `main.py --calibrate`)
+config.json
+config.json.tmp
+
 # Local debug artifacts (screenshots, throwaway templates, scratch scripts)
 screens/
 oldbobber.png
