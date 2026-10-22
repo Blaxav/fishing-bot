@@ -2,6 +2,12 @@
 
 A Python bot that automates fishing in WoW Classic. Uses **sound-based splash detection** for reliable fish bite detection — no more false positives from water ripples.
 
+> ⚠ **Personal use only.** This is a private hobby project, published as-is for my own
+> reference. It is not intended for distribution, is not supported for anyone else, and
+> comes with no guarantees of any kind. Automating gameplay violates the World of
+> Warcraft Terms of Service and can get your account suspended or banned — use at your
+> own risk.
+
 ## How It Works
 
 1. Presses key `1` to cast the fishing line
