@@ -8,6 +8,8 @@ Usage:
     python main.py --calibrate      # Calibrate screen region
     python main.py --test-input     # Test if key presses reach the game
     python main.py --test-bobber    # Debug bobber detection (saves image)
+    python main.py --list-audio     # List capture devices / verify Stereo Mix
+    python main.py --audio-debug    # Live audio levels + threshold calibration
     python main.py --list-monitors  # List available monitors
 
 Environment variables:
@@ -23,6 +25,14 @@ import time
 # ── Load .env FIRST, before any bot imports ────────────────────────────
 from dotenv import load_dotenv
 load_dotenv()
+
+# Never let a non-ASCII log line crash the program when stdout is redirected
+# to a file or pipe (Windows defaults to a legacy code page there).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 import keyboard
 from bot import FisherBot
@@ -75,23 +85,55 @@ def calibration_mode():
 
 
 def _audio_debug_mode() -> None:
-    """Standalone audio monitor — prints RMS every ~0.5s so you can tune thresholds."""
-    os.environ["WOWBOT_AUDIO_DEBUG"] = "1"
-    from bot.audio import AUDIO_DEBUG, AudioMonitor
-    print("=" * 50)
-    print("  Audio Debug Mode")
-    print("  Prints RMS amplitude every ~0.5s")
-    print("  Make some noise in-game (splash) to see values")
-    print("  Press Ctrl+C to stop")
-    print("=" * 50)
-    monitor = AudioMonitor()
+    """Standalone audio monitor: live levels + why blocks were rejected.
+
+    Cast in-game, watch the `rms` figure while a fish bites, then set
+    WOWBOT_MIN_AMP (and WOWBOT_SPIKE_MULT) in .env accordingly.
+    """
+    from bot.audio import MIN_AMPLITUDE, SPIKE_THRESHOLD_MULTIPLIER, AudioMonitor
+
+    print("=" * 60)
+    print("  Audio Calibration Mode")
+    print(f"  min_amp={MIN_AMPLITUDE}  spike_mult={SPIKE_THRESHOLD_MULTIPLIER}")
+    print("  Cast in-game and compare 'rms' while waiting vs. at the splash.")
+    print("  Press Ctrl+C to stop and get suggested values.")
+    print("=" * 60)
+
+    monitor = AudioMonitor(debug=True)
     monitor.start()
+
     try:
         while True:
-            time.sleep(0.5)
+            time.sleep(0.25)
+            snap = monitor.snapshot()
+            floor = snap["floor"]
+            ratio = (snap["rms"] / floor) if floor > 0 else 0.0
+            print(
+                f"[Level] rms={snap['rms']:.5f} peak={snap['peak']:.5f} "
+                f"floor={floor:.5f} ratio={ratio:.1f}x "
+                f"max={snap['max_rms']:.5f} triggers={snap['triggers']}",
+                flush=True,
+            )
+            if not monitor.healthy():
+                print("[Level] WARNING: audio stream is not running!", flush=True)
     except KeyboardInterrupt:
         print("\nStopping...")
         monitor.stop()
+
+    snap = monitor.snapshot()
+    loudest = snap["max_rms"]
+    print("=" * 60)
+    print(f"  Loudest level seen: {loudest:.5f} ({snap['triggers']} trigger(s))")
+    if loudest > 0:
+        print(f"  Suggested: WOWBOT_MIN_AMP={max(loudest / 4.0, 0.0002):.4f}")
+        print("  Keep it well below a splash and above digital silence.")
+        if loudest < MIN_AMPLITUDE:
+            print("  WARNING: nothing ever exceeded MIN_AMP - lower WOWBOT_MIN_AMP!")
+    else:
+        print("  No audio captured at all - check Stereo Mix / output device.")
+    if snap["error"] is not None:
+        print(f"  Detection error: {snap['error']!r}")
+    print("=" * 60)
 
 
 def test_input_mode():
@@ -122,6 +164,9 @@ def test_input_mode():
 
 def main():
     # ── Debug modes ───────────────────────────────────────────────────
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        return
     if "--list-monitors" in sys.argv:
         screen.list_monitors()
         return
@@ -183,8 +228,8 @@ def main():
     print("  Press Ctrl+C to EXIT")
     print("=" * 50)
     print()
-    print("⚠  Run this terminal as ADMINISTRATOR if inputs are blocked.")
-    print("⚠  If audio fails: python main.py --list-audio")
+    print("!  Run this terminal as ADMINISTRATOR if inputs are blocked.")
+    print("!  If audio fails: python main.py --list-audio")
 
     try:
         # Polling loop so Ctrl+C works reliably on Windows

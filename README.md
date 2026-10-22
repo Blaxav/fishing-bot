@@ -72,14 +72,40 @@ Click the top-left and bottom-right corners of your game window, then copy-paste
 
 ## Tuning Audio Detection
 
-All constants are at the top of `bot/audio.py`:
+Set these in `.env` (all optional):
 
 | Parameter | Default | Description |
 |---|---|---|
-| `SPIKE_THRESHOLD_MULTIPLIER` | `3.0` | How many times louder than ambient the splash must be |
-| `MIN_AMPLITUDE` | `0.03` | Minimum volume to consider |
-| `NOISE_FLOOR_WINDOW` | `30` | Samples for ambient noise averaging |
-| `COOLDOWN_SECONDS` | `0.8` | Ignore spikes for this long after each detection |
+| `WOWBOT_SPIKE_MULT` | `2.0` | How many times louder than the recent median level the splash must be. Scale-free, so it works at any volume. Lower = more sensitive. |
+| `WOWBOT_MIN_AMP` | `0.0015` | Absolute floor, only meant to reject near-silence. **Must stay well below the level a splash reaches on your machine.** |
+| `WOWBOT_COOLDOWN` | `0.8` | Ignore spikes for this long after each detection (seconds). |
+| `WOWBOT_AUDIO_DEBUG` | `0` | Print the measured level and the reason each block was rejected. |
+
+### Calibrating
+
+```bash
+uv run python main.py --audio-debug
+```
+
+Cast in-game and compare the `[Level] rms=` value while waiting with the value at
+the moment of the splash. Typical numbers measured on this machine
+(Stereo Mix loopback, once attenuation by the Windows mixer is included):
+
+| Situation | `rms` |
+|---|---|
+| Idle / digital silence | ~0.00002 |
+| Gameplay ambience | ~0.0008 |
+| Splash | ~0.003 - 0.008 |
+
+Set `WOWBOT_MIN_AMP` to roughly a quarter of the loudest splash you see. Because
+`WOWBOT_SPIKE_MULT` is a ratio against the *median* of the last 1.5 s, it adapts
+to loud ambience (music, waterfalls) without needing retuning.
+
+Verify the detector logic without any hardware:
+
+```bash
+uv run python test_audio_detection.py
+```
 
 ## Tuning Bobber Detection
 
@@ -88,11 +114,12 @@ In `bot/screen.py`:
 | Parameter | Default | Description |
 |---|---|---|
 | `MATCH_THRESHOLD` | `0.5` | Template match sensitivity (lower = easier to find) |
+| `CLICK_OFFSET_X` / `CLICK_OFFSET_Y` | `0` | Nudge the click point when `bobber.png` is not centred on the sprite. Override with `WOWBOT_CLICK_OFFSET_X` / `WOWBOT_CLICK_OFFSET_Y` in `.env`. |
 
 ## Troubleshooting
 
 - **Bot doesn't press keys**: Run terminal as **Administrator**
 - **Audio fails**: Run `uv run python main.py --list-audio` and check Stereo Mix is enabled
 - **Bobber not found**: Lower `MATCH_THRESHOLD` in `bot/screen.py`, or replace `bobber.png`
-- **Splash not detected**: Game must be audible (not muted). Try increasing `SPIKE_THRESHOLD_MULTIPLIER` if too sensitive, or lowering it if missing splashes
-- **Right-click doesn't catch**: Make sure the bobber is still on screen when the click happens. Try adjusting `post_loot_delay` in `FisherBot` constructor
+- **Splash not detected**: Game must be audible (not muted). Run `uv run python main.py --audio-debug` and check the `rms` value at a splash is above `WOWBOT_MIN_AMP`; lower `WOWBOT_MIN_AMP` / `WOWBOT_SPIKE_MULT` if bites are missed, raise them if the bot clicks at random times
+- **Right-click doesn't catch**: The bot right-clicks the last place it saw the bobber, immediately after the splash. If the log shows `cursor landed at (x, y), not (x, y)`, something on the system is moving the pointer. If clicks land next to the bobber, set `WOWBOT_CLICK_OFFSET_X` / `WOWBOT_CLICK_OFFSET_Y` (e.g. `6` / `7`) to nudge the click onto the sprite. `post_loot_delay` in `FisherBot` controls the wait after a catch.

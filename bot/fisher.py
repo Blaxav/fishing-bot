@@ -94,20 +94,29 @@ class FisherBot:
             screen.show_finding(frame, bobber_pos, match_score)
 
             # Wait for bobber to submerge (fish bite) with tracking
-            bite = self._wait_for_bite_with_tracking(bobber_pos)
+            bite, tracked_pos = self._wait_for_bite_with_tracking(bobber_pos)
 
             if bite:
-                print("[Bot] Fish! Right-clicking bobber...")
+                # Click immediately at the freshest tracked position. Re-scanning
+                # the whole screen here (as before) added latency and usually
+                # failed anyway because the bobber is already submerged, so the
+                # bot ended up clicking the stale position from cast time.
+                click_pos = tracked_pos if tracked_pos is not None else bobber_pos
+                print(f"[Bot] Fish! Right-clicking bobber at {click_pos}...")
+
+                actual = inp.right_click(*click_pos)
+                if (abs(actual[0] - click_pos[0]) > 2
+                        or abs(actual[1] - click_pos[1]) > 2):
+                    print(f"[Bot] Warning: cursor landed at {actual}, not {click_pos}")
+
+                # Second click as a safety net — the bite window is short
+                time.sleep(0.15)
+                inp.right_click(*click_pos)
+
+                # Debug overlay after the clicks so it cannot delay the catch
                 frame = screen.capture()
-                screen.show_bite(frame, bobber_pos)
+                screen.show_bite(frame, click_pos)
 
-                fresh_pos = screen.get_last_position()
-                click_pos = fresh_pos if fresh_pos is not None else bobber_pos
-
-                # Right-click to catch (required in WoW Classic)
-                inp.right_click(*click_pos)
-                time.sleep(0.3)
-                inp.right_click(*click_pos)
                 time.sleep(self.post_loot_delay)
             else:
                 print("[Bot] Bobber timed out, recasting...")
@@ -127,10 +136,10 @@ class FisherBot:
                 template = screen._load_template()
                 frame = screen.capture()
                 if template is not None:
-                    result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
+                    result = screen.match_template(frame, template, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, _ = cv2.minMaxLoc(result)
                     # Double-check: reject weak matches (water, UI, etc.)
-                    if max_val < 0.5:
+                    if max_val < screen.MATCH_THRESHOLD:
                         print(f"[Bot] Bobber match too weak ({max_val:.3f}), retrying...")
                         continue
                     return pos, max_val
@@ -138,14 +147,20 @@ class FisherBot:
             time.sleep(self.bobber_search_interval)
         return None, 0.0
 
-    def _wait_for_bite_with_tracking(self, bobber_pos: tuple) -> bool:
-        """Monitor bobber with visual tracking overlay."""
+    def _wait_for_bite_with_tracking(self, bobber_pos: tuple) -> tuple:
+        """Monitor bobber with visual tracking overlay.
+
+        Returns (bite_detected, last_known_position). The position is the last
+        place the bobber was actually seen, which is where the catch click has
+        to land — after a bite the bobber is submerged and cannot be found
+        again by template matching.
+        """
         import cv2
         import numpy as np
 
         template = screen._load_template()
         if template is None:
-            return False
+            return False, bobber_pos
 
         bx, by = bobber_pos
         start_time = time.time()
@@ -170,27 +185,40 @@ class FisherBot:
         if search_area.shape[0] < h or search_area.shape[1] < w:
             search_area = frame
 
-        result = cv2.matchTemplate(search_area, template, cv2.TM_CCOEFF_NORMED)
+        result = screen.match_template(search_area, template, cv2.TM_CCOEFF_NORMED)
         _, baseline_score, _, _ = cv2.minMaxLoc(result)
         print(f"[Bot] Baseline bobber match: {baseline_score:.4f}")
 
         # Clear any stale audio detection before starting
         if self._audio is not None:
             self._audio.clear_bite()
+            if not self._audio.healthy():
+                print("[Bot] WARNING: audio capture is not running - "
+                      "falling back to visual detection only.")
 
         last_known_pos = bobber_pos
-        MATCH_THRESHOLD = 0.5
         DISAPPEAR_RATIO = 0.45
         POLL_INTERVAL = 0.2
+        # Keep refreshing the position while the bobber still matches well
+        # *relative to the baseline*. The absolute MATCH_THRESHOLD is too strict:
+        # when the template only scores ~0.37 at cast time, the score dips below
+        # it while the bobber bobs and the position would never be updated.
+        TRACK_RATIO = 0.8
+        # Ignore implausible jumps (false positives on water/UI elements)
+        MAX_TRACK_JUMP = 60
 
         while time.time() - start_time < 25.0:
             if not self._running:
-                return False
+                return False, last_known_pos
 
-            # Check audio splash detection
-            if self._audio is not None and self._audio.bite_detected():
-                print("[Bot] Audio splash detected! Fish on the line!")
-                return True
+            # Wake up instantly on the splash sound, otherwise poll every
+            # POLL_INTERVAL — the audio event is what triggers the catch click.
+            if self._audio is not None:
+                if self._audio.wait_for_bite(POLL_INTERVAL):
+                    print("[Bot] Audio splash detected! Fish on the line!")
+                    return True, last_known_pos
+            else:
+                time.sleep(POLL_INTERVAL)
 
             frame = screen.capture()
 
@@ -207,22 +235,22 @@ class FisherBot:
 
             search_area = frame[sy1:sy2, sx1:sx2]
             if search_area.shape[0] < h or search_area.shape[1] < w:
-                time.sleep(POLL_INTERVAL)
                 continue
 
-            result = cv2.matchTemplate(search_area, template, cv2.TM_CCOEFF_NORMED)
+            result = screen.match_template(search_area, template, cv2.TM_CCOEFF_NORMED)
             _, match_score, _, match_loc = cv2.minMaxLoc(result)
 
-            if match_score >= MATCH_THRESHOLD:
-                new_rel_x = sx1 + match_loc[0] + w // 2
-                new_rel_y = sy1 + match_loc[1] + h // 2
-                if screen._region is not None:
-                    bx = new_rel_x + screen._region["left"]
-                    by = new_rel_y + screen._region["top"]
-                else:
-                    bx = new_rel_x
-                    by = new_rel_y
-                last_known_pos = (bx, by)
+            if match_score >= baseline_score * TRACK_RATIO:
+                origin_x = sx1 + (screen._region["left"] if screen._region else 0)
+                origin_y = sy1 + (screen._region["top"] if screen._region else 0)
+                new_abs_x, new_abs_y = screen.click_point(
+                    match_loc, (w, h), (origin_x, origin_y))
+
+                if (abs(new_abs_x - bx) <= MAX_TRACK_JUMP
+                        and abs(new_abs_y - by) <= MAX_TRACK_JUMP):
+                    bx = new_abs_x
+                    by = new_abs_y
+                    last_known_pos = (bx, by)
 
             # Show tracking overlay
             screen.show_tracking(frame, last_known_pos, match_score)
@@ -230,8 +258,6 @@ class FisherBot:
             threshold = baseline_score * DISAPPEAR_RATIO
             if match_score < threshold:
                 print(f"[Bot] Bobber submerged! (score: {match_score:.4f} < {threshold:.4f})")
-                return True
+                return True, last_known_pos
 
-            time.sleep(POLL_INTERVAL)
-
-        return False
+        return False, last_known_pos

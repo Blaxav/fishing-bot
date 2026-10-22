@@ -43,13 +43,19 @@ def _env_bool(name: str, default: bool) -> bool:
 # ── Tuning constants (overridable via env vars) ───────────────────────
 
 # How far above the noise floor a spike must be to count as a bite.
-SPIKE_THRESHOLD_MULTIPLIER = _env_float("WOWBOT_SPIKE_MULT", 3.0)
+# This is a *ratio*, so it works at any system volume.
+SPIKE_THRESHOLD_MULTIPLIER = _env_float("WOWBOT_SPIKE_MULT", 2.0)
 
-# Absolute minimum amplitude to consider (filters out background hum).
-MIN_AMPLITUDE = _env_float("WOWBOT_MIN_AMP", 0.03)
+# Absolute minimum amplitude — only a "not digital silence" guard. Keep this
+# well below the level a splash reaches on your setup (run --audio-debug and
+# look at the `rms` value while a fish bites).
+MIN_AMPLITUDE = _env_float("WOWBOT_MIN_AMP", 0.0015)
 
-# How many recent amplitude samples to average for the noise floor.
+# How many recent amplitude samples are used for the noise floor.
 NOISE_FLOOR_WINDOW = 30
+
+# Ignore the first few blocks so the floor is meaningful.
+WARMUP_BLOCKS = 8
 
 # Audio sample rate (Hz).
 SAMPLE_RATE = 22050
@@ -60,7 +66,7 @@ BLOCK_DURATION = 0.05
 # After a spike is detected, ignore further spikes for this many seconds.
 COOLDOWN_SECONDS = _env_float("WOWBOT_COOLDOWN", 0.8)
 
-# Print every RMS value to stdout (for debugging). Override: WOWBOT_AUDIO_DEBUG=1
+# Print level information to stdout (for debugging). Override: WOWBOT_AUDIO_DEBUG=1
 AUDIO_DEBUG = _env_bool("WOWBOT_AUDIO_DEBUG", False)
 
 
@@ -76,11 +82,13 @@ class AudioMonitor:
         monitor.stop()
     """
 
-    def __init__(self):
+    def __init__(self, debug: Optional[bool] = None):
         if not HAS_SOUNDDEVICE:
             raise RuntimeError(
                 "sounddevice not installed. Run: uv add sounddevice"
             )
+
+        self._debug = AUDIO_DEBUG if debug is None else debug
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -93,6 +101,45 @@ class AudioMonitor:
         self._bite_flag = threading.Event()
         self._last_spike_time = 0.0
         self._lock = threading.Lock()
+
+        # Realtime-safe message queue. The audio callback must never print:
+        # stdout is slow and, worse, a print() that raises (e.g. a Unicode
+        # character on a non-UTF-8 stdout) propagates through PortAudio and
+        # stops the stream for the rest of the session.
+        self._messages: collections.deque = collections.deque(maxlen=32)
+        self._callback_error: Optional[BaseException] = None
+        self._last_debug_print = 0.0
+
+        # Diagnostics (read by --audio-debug)
+        self._last_rms = 0.0
+        self._last_peak = 0.0
+        self._noise_floor = 0.0
+        self._trigger_count = 0
+        self._max_rms = 0.0
+
+    # ── Status ────────────────────────────────────────────────────────
+
+    def healthy(self) -> bool:
+        """True while the capture stream is actually running."""
+        try:
+            return self._stream is not None and bool(self._stream.active)
+        except Exception:  # noqa: BLE001 - closed/invalid stream
+            return False
+
+    def snapshot(self) -> dict:
+        """Current level information, for calibration/debug output."""
+        return {
+            "rms": self._last_rms,
+            "peak": self._last_peak,
+            "floor": self._noise_floor,
+            "max_rms": self._max_rms,
+            "triggers": self._trigger_count,
+            "error": self._callback_error,
+        }
+
+    def _emit(self, message: str) -> None:
+        """Queue a message for the (non-realtime) audio thread to print."""
+        self._messages.append(message)
 
     def start(self) -> None:
         """Start capturing system audio via WASAPI loopback."""
@@ -126,6 +173,7 @@ class AudioMonitor:
                 pass
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+        self._drain_messages()
         print("[Audio] Stopped.")
 
     def bite_detected(self) -> bool:
@@ -134,6 +182,20 @@ class AudioMonitor:
         Returns True once per detection, then resets the flag.
         """
         return self._bite_flag.is_set()
+
+    def wait_for_bite(self, timeout: float) -> bool:
+        """Block until a splash is detected, or until `timeout` seconds pass.
+
+        Lets the fishing loop react to a splash immediately instead of only
+        checking the flag every POLL_INTERVAL. Like bite_detected(), this does
+        not clear the flag.
+        """
+        detected = self._bite_flag.wait(timeout)
+        if detected:
+            # Flush the queued "Splash detected" line so the log stays in
+            # order. Safe here: this is not the realtime callback thread.
+            self._drain_messages()
+        return detected
 
     def clear_bite(self) -> None:
         """Reset the bite detection flag."""
@@ -182,7 +244,7 @@ class AudioMonitor:
                     return idx
 
         print("[Audio] No system-audio capture device found.")
-        print("[Audio] Enable 'Stereo Mix' in Windows Sound settings → Recording tab.")
+        print("[Audio] Enable 'Stereo Mix' in Windows Sound settings -> Recording tab.")
         print("[Audio] Run --list-audio to see available devices.")
         return None
 
@@ -202,59 +264,91 @@ class AudioMonitor:
 
         return None
 
+    def _drain_messages(self) -> None:
+        """Print messages queued by the realtime callback."""
+        while self._messages:
+            try:
+                message = self._messages.popleft()
+            except IndexError:
+                return
+            try:
+                print(message, flush=True)
+            except Exception:  # noqa: BLE001 - logging must never break audio
+                pass
+
+    def _process_block(self, indata) -> None:
+        """Analyse one audio chunk (called from the PortAudio callback).
+
+        The level of this chunk is compared with the *median* level of the
+        previous NOISE_FLOOR_WINDOW chunks. A median is used instead of a mean
+        because a mean is dragged up by the splash itself and by loud ambience,
+        which pushed real bites below the ratio test.
+        """
+        data = np.asarray(indata, dtype=np.float32)
+        if data.ndim > 1:
+            data = data.mean(axis=1)  # any channel count -> mono
+        if data.size == 0:
+            return
+
+        rms = float(np.sqrt(np.mean(np.square(data))))
+        peak = float(np.max(np.abs(data)))
+        now = time.time()
+
+        with self._lock:
+            self._last_rms = rms
+            self._last_peak = peak
+            if rms > self._max_rms:
+                self._max_rms = rms
+
+            # Floor comes from the chunks *before* this one
+            floor = float(np.median(self._amplitude_history)) if self._amplitude_history else 0.0
+            self._noise_floor = floor
+            self._amplitude_history.append(rms)
+
+            if len(self._amplitude_history) < WARMUP_BLOCKS or floor <= 0.0:
+                reason = "warmup"
+            elif rms < MIN_AMPLITUDE:
+                reason = f"below min_amp ({rms:.5f} < {MIN_AMPLITUDE:.5f})"
+            else:
+                ratio = rms / floor
+                if ratio < SPIKE_THRESHOLD_MULTIPLIER:
+                    reason = f"below ratio ({ratio:.2f}x < {SPIKE_THRESHOLD_MULTIPLIER:.2f}x)"
+                elif now - self._last_spike_time <= COOLDOWN_SECONDS:
+                    reason = "cooldown"
+                else:
+                    self._last_spike_time = now
+                    self._trigger_count += 1
+                    self._bite_flag.set()
+                    reason = "trigger"
+                    self._emit(
+                        f"[Audio] Splash detected! (rms {rms:.5f}, "
+                        f"floor {floor:.5f}, {ratio:.1f}x, peak {peak:.5f})")
+
+            if self._debug and now - self._last_debug_print > 0.5:
+                self._last_debug_print = now
+                ratio_dbg = (rms / floor) if floor > 0 else 0.0
+                self._emit(
+                    f"[Audio Debug] rms={rms:.5f} peak={peak:.5f} "
+                    f"floor={floor:.5f} ratio={ratio_dbg:.1f}x "
+                    f"min_amp={MIN_AMPLITUDE} spike_mult={SPIKE_THRESHOLD_MULTIPLIER} "
+                    f"-> {reason}")
+
     def _audio_thread(self, device) -> None:
         """Background thread: captures audio and detects spikes."""
         blocksize = int(SAMPLE_RATE * BLOCK_DURATION)
 
-        debug_print_counter = 0
-        last_debug_print = 0.0
-
         def audio_callback(indata, frames, time_info, status):
-            nonlocal debug_print_counter, last_debug_print
-
+            # Runs on the PortAudio realtime thread: never print or touch the
+            # filesystem here. Any exception escaping this function aborts the
+            # stream for the rest of the session, so everything is caught and
+            # reported through the message queue instead.
             if not self._running:
                 return
-
-            if status and "input underflow" not in str(status) and "input overflow" not in str(status):
-                return
-
-            # Compute RMS amplitude of this chunk
-            data = np.frombuffer(indata, dtype=np.float32)
-            if data.size == 0:
-                return
-            if data.size >= 2:
-                data = data.reshape(-1, 2).mean(axis=1)
-
-            rms = float(np.sqrt(np.mean(data**2)))
-
-            with self._lock:
-                self._amplitude_history.append(rms)
-
-                # Debug: print RMS every ~0.5s
-                if AUDIO_DEBUG:
-                    now_debug = time.time()
-                    if now_debug - last_debug_print > 0.5:
-                        last_debug_print = now_debug
-                        avg = np.mean(list(self._amplitude_history)) if self._amplitude_history else 0
-                        print(f"[Audio Debug] RMS={rms:.6f} | floor_avg={avg:.6f} | spike_mult={SPIKE_THRESHOLD_MULTIPLIER} | min_amp={MIN_AMPLITUDE}")
-                        if rms > MIN_AMPLITUDE and avg > 0 and rms > avg * SPIKE_THRESHOLD_MULTIPLIER:
-                            print(f"[Audio Debug]   ^^^ WOULD TRIGGER SPIKE (but debounce applies)")
-
-                # Need enough samples to establish noise floor
-                if len(self._amplitude_history) < NOISE_FLOOR_WINDOW // 3:
-                    return
-
-                avg_noise = np.mean(list(self._amplitude_history))
-                if avg_noise < 0.001:
-                    avg_noise = 0.001  # avoid division by zero
-
-                # Check for spike
-                if rms > MIN_AMPLITUDE and rms > avg_noise * SPIKE_THRESHOLD_MULTIPLIER:
-                    now = time.time()
-                    if now - self._last_spike_time > COOLDOWN_SECONDS:
-                        self._last_spike_time = now
-                        self._bite_flag.set()
-                        print(f"[Audio] ⚡ Splash detected! (amplitude: {rms:.4f}, floor: {avg_noise:.4f})")
+            try:
+                self._process_block(indata)
+            except Exception as exc:  # noqa: BLE001 - never kill the stream
+                self._callback_error = exc
+                self._emit(f"[Audio] Detection error: {exc!r}")
 
         # Try a sequence of devices — first the "best" (Stereo Mix/loopback),
         # then fall back to default input if that fails.
@@ -306,14 +400,21 @@ class AudioMonitor:
 
         if not stream_started:
             print(f"[Audio] Error: {last_error}")
-            print("[Audio] Try: Settings → Sound → Recording → enable 'Stereo Mix'")
+            print("[Audio] Try: Settings -> Sound -> Recording -> enable 'Stereo Mix'")
             print("[Audio] Or install VB-Audio Virtual Cable (free)")
             return
 
         # Main loop — keep thread alive while streaming
         try:
             while self._running:
-                time.sleep(0.1)
+                time.sleep(0.05)
+                self._drain_messages()
+                # Surface a dead stream (device removed, driver reset, resume
+                # from sleep) instead of spinning forever while nothing is heard.
+                if self._running and not self.healthy():
+                    self._emit("[Audio] Capture stream stopped unexpectedly - "
+                               "bites will no longer be detected by sound.")
+                    break
         except Exception as e:
             print(f"[Audio] Runtime error: {e}")
         finally:
@@ -323,6 +424,7 @@ class AudioMonitor:
                     self._stream.close()
                 except Exception:
                     pass
+            self._drain_messages()
 
 
 def list_audio_devices() -> None:
@@ -353,5 +455,5 @@ def list_audio_devices() -> None:
     print("=" * 60)
     print()
     print("Look for a device with 'loopback' in the name (WASAPI).")
-    print("If none: right-click speaker → Sounds → Recording →")
+    print("If none: right-click speaker -> Sounds -> Recording ->")
     print("  enable 'Stereo Mix', OR install VB-Audio Virtual Cable.")

@@ -13,6 +13,11 @@ _BOBBER_PATH = Path(__file__).parent.parent / "bobber.png"
 _region: Optional[dict] = None
 _monitor_index: int = int(os.environ.get("WOWBOT_MONITOR", "1"))
 
+# Cached bobber template + the mtime it was read at (avoids disk I/O on the
+# bite -> click path). Invalidated automatically when bobber.png changes.
+_template_cache: Optional[np.ndarray] = None
+_template_mtime: Optional[float] = None
+
 # Template match threshold for finding the bobber
 # INCREASED: was 0.5, but that matched random UI elements on wrong monitor
 MATCH_THRESHOLD = float(os.environ.get("WOWBOT_BOBBER_THRESHOLD", "0.5"))
@@ -20,6 +25,12 @@ MATCH_THRESHOLD = float(os.environ.get("WOWBOT_BOBBER_THRESHOLD", "0.5"))
 # When the match score drops below this ratio of the initial score,
 # the bobber is considered submerged (fish bite detected)
 DISAPPEAR_RATIO = 0.45
+
+# Optional nudge (in pixels) for the click point. bobber.png is a hand-made
+# crop and often contains the fishing line / splash, which pushes the sprite
+# away from the crop centre. Set these if the bot clicks next to the bobber.
+CLICK_OFFSET_X = int(os.environ.get("WOWBOT_CLICK_OFFSET_X", "0"))
+CLICK_OFFSET_Y = int(os.environ.get("WOWBOT_CLICK_OFFSET_Y", "0"))
 
 # Polling interval while waiting for bite
 POLL_INTERVAL = 0.2
@@ -45,20 +56,89 @@ def capture() -> np.ndarray:
 
 
 def _load_template() -> Optional[np.ndarray]:
+    """Load (and cache) the bobber template.
+
+    The template is re-read only when bobber.png changes on disk, which keeps
+    the bite -> click path free of disk I/O. The returned array must not be
+    modified by callers (it is shared).
+    """
+    global _template_cache, _template_mtime
+
     if not _BOBBER_PATH.exists():
         print(f"[ERROR] Bobber template not found: {_BOBBER_PATH}")
         return None
+
+    mtime = _BOBBER_PATH.stat().st_mtime
+    if _template_cache is not None and _template_mtime == mtime:
+        return _template_cache
+
     template = cv2.imread(str(_BOBBER_PATH))
     if template is None:
         print(f"[ERROR] Failed to load: {_BOBBER_PATH}")
         return None
+
+    _template_cache = template
+    _template_mtime = mtime
     return template
+
+
+# ── CLAHE preprocessing for low-light illumination invariance ───────────
+
+_clahe = None  # Lazy-initialized CLAHE object
+
+
+def _get_clahe():
+    """Return a CLAHE object, creating it on first call."""
+    global _clahe
+    if _clahe is None:
+        _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return _clahe
+
+
+def _apply_clahe_rgb(frame: np.ndarray) -> np.ndarray:
+    """Apply CLAHE to the lightness channel of an RGB image.
+    
+    Converts to LAB, equalizes the L channel, converts back to RGB.
+    This improves contrast in dark/night conditions without distorting colors.
+    """
+    lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    l_eq = _get_clahe().apply(l_channel)
+    lab_eq = cv2.merge([l_eq, a_channel, b_channel])
+    return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+
+
+def match_template(search_area: np.ndarray, template: np.ndarray,
+                   method: int = cv2.TM_CCOEFF_NORMED) -> np.ndarray:
+    """Template matching with CLAHE preprocessing for illumination invariance.
+    
+    Both the search area and template are enhanced with CLAHE before
+    matching, making detection reliable in low-light/night conditions.
+    Returns the same result matrix as cv2.matchTemplate.
+    """
+    enhanced_area = _apply_clahe_rgb(search_area)
+    enhanced_template = _apply_clahe_rgb(template)
+    return cv2.matchTemplate(enhanced_area, enhanced_template, method)
 
 
 def _abs_to_local(abs_x: int, abs_y: int) -> Tuple[int, int]:
     if _region is not None:
         return (abs_x - _region["left"], abs_y - _region["top"])
     return (abs_x, abs_y)
+
+
+def click_point(match_loc: Tuple[int, int], template_size: Tuple[int, int],
+                origin: Tuple[int, int] = (0, 0)) -> Tuple[int, int]:
+    """Absolute screen point to click for a template match.
+
+    `match_loc` is the template's top-left corner inside the searched area and
+    `origin` is that area's top-left in absolute screen coordinates (scan
+    region offset + local ROI offset). WOWBOT_CLICK_OFFSET_X/Y nudge the point
+    when bobber.png is not centred on the sprite.
+    """
+    w, h = template_size
+    return (origin[0] + match_loc[0] + w // 2 + CLICK_OFFSET_X,
+            origin[1] + match_loc[1] + h // 2 + CLICK_OFFSET_Y)
 
 
 def find_bobber() -> Optional[Tuple[int, int]]:
@@ -68,7 +148,7 @@ def find_bobber() -> Optional[Tuple[int, int]]:
         return None
 
     frame = capture()
-    result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
+    result = match_template(frame, template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
     print(f"[Bot] Bobber search: best_match={max_val:.4f} (threshold={MATCH_THRESHOLD})")
@@ -77,12 +157,8 @@ def find_bobber() -> Optional[Tuple[int, int]]:
         return None
 
     h, w = template.shape[:2]
-    rel_x = max_loc[0] + w // 2
-    rel_y = max_loc[1] + h // 2
-
-    if _region is not None:
-        return (rel_x + _region["left"], rel_y + _region["top"])
-    return (rel_x, rel_y)
+    origin = (_region["left"], _region["top"]) if _region is not None else (0, 0)
+    return click_point(max_loc, (w, h), origin)
 
 
 def wait_for_bite(bobber_pos: Tuple[int, int], timeout: float = MAX_WAIT_TIME) -> bool:
@@ -109,7 +185,7 @@ def wait_for_bite(bobber_pos: Tuple[int, int], timeout: float = MAX_WAIT_TIME) -
     if search_area.shape[0] < h or search_area.shape[1] < w:
         search_area = frame
 
-    result = cv2.matchTemplate(search_area, template, cv2.TM_CCOEFF_NORMED)
+    result = match_template(search_area, template, cv2.TM_CCOEFF_NORMED)
     _, baseline_score, _, _ = cv2.minMaxLoc(result)
     print(f"[Bot] Baseline bobber match: {baseline_score:.4f}")
 
@@ -128,7 +204,7 @@ def wait_for_bite(bobber_pos: Tuple[int, int], timeout: float = MAX_WAIT_TIME) -
             time.sleep(POLL_INTERVAL)
             continue
 
-        result = cv2.matchTemplate(search_area, template, cv2.TM_CCOEFF_NORMED)
+        result = match_template(search_area, template, cv2.TM_CCOEFF_NORMED)
         _, match_score, _, match_loc = cv2.minMaxLoc(result)
 
         if match_score >= MATCH_THRESHOLD:
@@ -266,7 +342,7 @@ def debug_bobber() -> None:
         return
 
     frame = capture()
-    result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
+    result = match_template(frame, template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
     print(f"Best match score: {max_val:.4f} (threshold: {MATCH_THRESHOLD})")
@@ -286,7 +362,7 @@ def debug_bobber() -> None:
     print(f"Annotated image saved to: {save_path}")
     print(f"Monitor resolution: {frame.shape[1]}x{frame.shape[0]}")
     print()
-    print("Check bobber_debug.png — green = best match, red = other matches > 0.4")
+    print("Check bobber_debug.png - green = best match, red = other matches > 0.4")
     print(f"If bobber isn't marked: try WOWBOT_MONITOR=2 or WOWBOT_MONITOR=0")
 
 

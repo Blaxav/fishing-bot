@@ -10,3 +10,9 @@ wheels/
 .venv
 
 debug_frames/*
+
+# Local debug artifacts (screenshots, throwaway templates, scratch scripts)
+screens/
+oldbobber.png
+bobber-bakup.png
+test_multiscale.py

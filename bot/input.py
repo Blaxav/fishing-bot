@@ -8,11 +8,12 @@ real hardware input by games.
 import time
 import ctypes
 from ctypes import wintypes
+from typing import Tuple
 
 # ── Windows API types and constants ───────────────────────────────────
 
-# SendInput
-user32 = ctypes.windll.user32
+# SendInput (use_last_error so failed calls can be reported properly)
+user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 INPUT_KEYBOARD = 1
 INPUT_MOUSE = 0
@@ -77,6 +78,13 @@ class INPUT(ctypes.Structure):
     ]
 
 
+class POINT(ctypes.Structure):
+    _fields_ = [
+        ("x", wintypes.LONG),
+        ("y", wintypes.LONG),
+    ]
+
+
 def _send_keyboard(vk_code: int, key_up: bool = False) -> None:
     """Send a single keyboard event via SendInput."""
     flags = KEYEVENTF_SCANCODE
@@ -84,8 +92,7 @@ def _send_keyboard(vk_code: int, key_up: bool = False) -> None:
         flags |= KEYEVENTF_KEYUP
 
     # Map virtual key to scan code using MapVirtualKey
-    mapvk = ctypes.windll.user32.MapVirtualKeyW
-    scan_code = mapvk(vk_code, 0)  # MAPVK_VK_TO_VSC = 0
+    scan_code = user32.MapVirtualKeyW(vk_code, 0)  # MAPVK_VK_TO_VSC = 0
 
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
@@ -114,95 +121,91 @@ def press_fishing_key(key: str = "1") -> None:
     _send_keyboard(vk, key_up=True)
 
 
-def move_and_click(x: int, y: int) -> None:
+# ── Mouse helpers ─────────────────────────────────────────────────────
+
+def get_cursor_pos() -> Tuple[int, int]:
+    """Return the current OS cursor position in screen pixels."""
+    pt = POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    return (int(pt.x), int(pt.y))
+
+
+def _screen_size() -> Tuple[int, int]:
+    return (user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
+
+
+def _send_mouse(dx: int, dy: int, flags: int) -> bool:
+    """Send one mouse event via SendInput. Returns True when it was accepted."""
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.union.mi.dx = dx
+    inp.union.mi.dy = dy
+    inp.union.mi.mouseData = 0
+    inp.union.mi.dwFlags = flags
+    inp.union.mi.time = 0
+    inp.union.mi.dwExtraInfo = None
+    if user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp)) != 1:
+        print(f"[Input] SendInput failed (WinError {ctypes.get_last_error()})")
+        return False
+    return True
+
+
+def move_to(x: int, y: int) -> Tuple[int, int]:
+    """Move the cursor to screen pixel (x, y) and make sure it really got there.
+
+    The move goes through SendInput so the game receives a genuine mouse move,
+    then the result is verified with GetCursorPos. If the cursor ended up
+    somewhere else (DPI mismatch, pointer acceleration, another program or the
+    game itself warping the cursor, ...), SetCursorPos snaps it to the exact
+    pixel before any button event is sent.
+
+    MOUSEEVENTF_ABSOLUTE maps 0..65535 onto 0..(screen_size - 1), hence the
+    -1 in the normalisation.
+    """
+    screen_width, screen_height = _screen_size()
+    abs_x = int(round(x * 65535 / max(1, screen_width - 1)))
+    abs_y = int(round(y * 65535 / max(1, screen_height - 1)))
+
+    _send_mouse(abs_x, abs_y, MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE)
+
+    actual = get_cursor_pos()
+    if abs(actual[0] - x) > 1 or abs(actual[1] - y) > 1:
+        user32.SetCursorPos(int(x), int(y))
+        actual = get_cursor_pos()
+
+    return actual
+
+
+def click(x: int, y: int, button: str = "left") -> Tuple[int, int]:
+    """Move the cursor to (x, y) and click there.
+
+    Returns the cursor position the click was issued from, so callers can log
+    or verify where the click actually landed.
+    """
+    actual = move_to(x, y)
+
+    if button == "right":
+        down_flag, up_flag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
+    else:
+        down_flag, up_flag = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
+
+    # Give the game one frame to register the new cursor position
+    time.sleep(0.02)
+    _send_mouse(0, 0, down_flag)
+    time.sleep(0.02)
+    _send_mouse(0, 0, up_flag)
+
+    return actual
+
+
+def move_and_click(x: int, y: int) -> Tuple[int, int]:
     """Move the mouse to (x, y) and left-click."""
-    # Get screen dimensions for absolute positioning
-    screen_width = ctypes.windll.user32.GetSystemMetrics(0)
-    screen_height = ctypes.windll.user32.GetSystemMetrics(1)
-
-    # Normalize coordinates (0–65535 range for absolute mouse input)
-    abs_x = int(x * 65535 / screen_width)
-    abs_y = int(y * 65535 / screen_height)
-
-    # Move
-    inp_move = INPUT()
-    inp_move.type = INPUT_MOUSE
-    inp_move.union.mi.dx = abs_x
-    inp_move.union.mi.dy = abs_y
-    inp_move.union.mi.mouseData = 0
-    inp_move.union.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE
-    inp_move.union.mi.time = 0
-    inp_move.union.mi.dwExtraInfo = None
-    user32.SendInput(1, ctypes.byref(inp_move), ctypes.sizeof(inp_move))
-
-    time.sleep(0.05)
-
-    # Left button down
-    inp_down = INPUT()
-    inp_down.type = INPUT_MOUSE
-    inp_down.union.mi.dx = 0
-    inp_down.union.mi.dy = 0
-    inp_down.union.mi.mouseData = 0
-    inp_down.union.mi.dwFlags = MOUSEEVENTF_LEFTDOWN
-    inp_down.union.mi.time = 0
-    inp_down.union.mi.dwExtraInfo = None
-    user32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(inp_down))
-
-    time.sleep(0.02)
-
-    # Left button up
-    inp_up = INPUT()
-    inp_up.type = INPUT_MOUSE
-    inp_up.union.mi.dx = 0
-    inp_up.union.mi.dy = 0
-    inp_up.union.mi.mouseData = 0
-    inp_up.union.mi.dwFlags = MOUSEEVENTF_LEFTUP
-    inp_up.union.mi.time = 0
-    inp_up.union.mi.dwExtraInfo = None
-    user32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(inp_up))
+    return click(x, y, "left")
 
 
-def right_click(x: int, y: int) -> None:
-    """Right-click at (x, y) using SendInput."""
-    screen_width = ctypes.windll.user32.GetSystemMetrics(0)
-    screen_height = ctypes.windll.user32.GetSystemMetrics(1)
-
-    abs_x = int(x * 65535 / screen_width)
-    abs_y = int(y * 65535 / screen_height)
-
-    inp_move = INPUT()
-    inp_move.type = INPUT_MOUSE
-    inp_move.union.mi.dx = abs_x
-    inp_move.union.mi.dy = abs_y
-    inp_move.union.mi.mouseData = 0
-    inp_move.union.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE
-    inp_move.union.mi.time = 0
-    inp_move.union.mi.dwExtraInfo = None
-    user32.SendInput(1, ctypes.byref(inp_move), ctypes.sizeof(inp_move))
-
-    time.sleep(0.05)
-
-    inp_down = INPUT()
-    inp_down.type = INPUT_MOUSE
-    inp_down.union.mi.dx = 0
-    inp_down.union.mi.dy = 0
-    inp_down.union.mi.mouseData = 0
-    inp_down.union.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN
-    inp_down.union.mi.time = 0
-    inp_down.union.mi.dwExtraInfo = None
-    user32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(inp_down))
-
-    time.sleep(0.02)
-
-    inp_up = INPUT()
-    inp_up.type = INPUT_MOUSE
-    inp_up.union.mi.dx = 0
-    inp_up.union.mi.dy = 0
-    inp_up.union.mi.mouseData = 0
-    inp_up.union.mi.dwFlags = MOUSEEVENTF_RIGHTUP
-    inp_up.union.mi.time = 0
-    inp_up.union.mi.dwExtraInfo = None
-    user32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(inp_up))
+def right_click(x: int, y: int) -> Tuple[int, int]:
+    """Move the mouse to (x, y) and right-click."""
+    return click(x, y, "right")
 
 
 def small_sleep(seconds: float = 0.5) -> None:
